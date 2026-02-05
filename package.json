@@ -1,0 +1,27 @@
+{
+  "name": "openclaw-zoom-agent",
+  "version": "1.0.0",
+  "description": "AI-powered meeting participant that joins Zoom calls via phone, with OpenClaw as the brain",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "openclaw",
+    "zoom",
+    "ai",
+    "voice",
+    "meeting",
+    "retell"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.16.0",
+    "express": "^4.18.2",
+    "openai": "^4.28.0",
+    "dotenv": "^16.4.1"
+  }
+}
