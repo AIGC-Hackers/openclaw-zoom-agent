@@ -32,6 +32,38 @@ if (!meetingId) {
 // --- OpenAI client ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// --- OpenClaw brain integration ---
+const OPENCLAW_GATEWAY = process.env.OPENCLAW_GATEWAY || 'http://localhost:18789';
+const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
+const USE_OPENCLAW_BRAIN = process.env.USE_OPENCLAW_BRAIN === 'true';
+
+async function askOpenClawBrain(text) {
+  if (!USE_OPENCLAW_BRAIN) return null;
+  try {
+    const res = await fetch(`${OPENCLAW_GATEWAY}/api/sessions/send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(OPENCLAW_TOKEN ? { 'Authorization': `Bearer ${OPENCLAW_TOKEN}` } : {}),
+      },
+      body: JSON.stringify({
+        message: `[Zoom Meeting Context] Someone in the meeting said: "${text}"\n\nProvide a brief, helpful response (1-2 sentences max). Respond in the same language they used.`,
+        label: 'zoom-agent-brain',
+        timeoutSeconds: 15,
+      }),
+    });
+    if (!res.ok) {
+      console.log(`⚠️ OpenClaw brain HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    return data?.reply || data?.message || null;
+  } catch (err) {
+    console.log(`⚠️ OpenClaw brain error: ${err.message}`);
+    return null;
+  }
+}
+
 // --- Telnyx REST (with retry) ---
 async function api(method, path, body, retries = 3) {
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -181,14 +213,26 @@ async function processAndRespond() {
       conversationHistory.splice(1, conversationHistory.length - 11);
     }
     
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: conversationHistory,
-      max_tokens: 150,
-      temperature: 0.7,
-    });
+    let response = null;
     
-    const response = completion.choices[0]?.message?.content;
+    // Try OpenClaw brain first (if enabled)
+    if (USE_OPENCLAW_BRAIN) {
+      console.log('🧠 Asking OpenClaw brain...');
+      response = await askOpenClawBrain(userText);
+      if (response) console.log('🧠 OpenClaw brain responded');
+    }
+    
+    // Fall back to GPT-4o-mini
+    if (!response) {
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: conversationHistory,
+        max_tokens: 150,
+        temperature: 0.7,
+      });
+      response = completion.choices[0]?.message?.content;
+    }
+    
     if (response) {
       conversationHistory.push({ role: 'assistant', content: response });
       console.log(`💬 Response: "${response}"`);

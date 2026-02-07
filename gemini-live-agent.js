@@ -101,18 +101,51 @@ function pcmToUlaw(sample) {
   return ~(sign | (exponent << 4) | mantissa) & 0xFF;
 }
 
-// Convert µ-law 8kHz buffer to PCM 16kHz (simple upsampling via linear interpolation)
+// Convert µ-law 8kHz buffer to PCM 16kHz with proper resampling
+// Uses zero-stuffing + simple FIR low-pass filter to avoid aliasing
+const LP_TAPS = [0.025, 0.075, 0.15, 0.25, 0.25, 0.15, 0.075, 0.025]; // 8-tap LPF
+let _resampleCarry = new Float64Array(LP_TAPS.length); // state between chunks
+
 function ulawToPcm16k(ulawBuf) {
-  const samples8k = ulawBuf.length;
-  const pcm16k = Buffer.alloc(samples8k * 4); // 2x samples, 2 bytes each
+  const n = ulawBuf.length;
+  const upsampled = new Float64Array(n * 2); // zero-stuffed
   
-  for (let i = 0; i < samples8k; i++) {
-    const s1 = ULAW_DECODE[ulawBuf[i]];
-    const s2 = (i < samples8k - 1) ? ULAW_DECODE[ulawBuf[i + 1]] : s1;
-    const interp = (s1 + s2) >> 1;
-    
-    pcm16k.writeInt16LE(s1, i * 4);
-    pcm16k.writeInt16LE(interp, i * 4 + 2);
+  // Decode µ-law and zero-stuff (insert zero between each sample)
+  for (let i = 0; i < n; i++) {
+    upsampled[i * 2] = ULAW_DECODE[ulawBuf[i]] * 2.0; // gain compensation for zero-stuffing
+    upsampled[i * 2 + 1] = 0;
+  }
+  
+  // Apply FIR low-pass filter to smooth interpolation
+  const filtered = new Float64Array(n * 2);
+  const carry = _resampleCarry;
+  const taps = LP_TAPS;
+  const tl = taps.length;
+  
+  for (let i = 0; i < n * 2; i++) {
+    let sum = 0;
+    for (let t = 0; t < tl; t++) {
+      const si = i - t;
+      const val = si >= 0 ? upsampled[si] : carry[carry.length + si] || 0;
+      sum += val * taps[t];
+    }
+    filtered[i] = sum;
+  }
+  
+  // Save last samples as carry for next chunk continuity
+  const carryStart = Math.max(0, n * 2 - tl);
+  for (let i = 0; i < tl; i++) {
+    const si = carryStart + i;
+    _resampleCarry[i] = si < n * 2 ? upsampled[si] : 0;
+  }
+  
+  // Convert to 16-bit PCM buffer with clipping
+  const pcm16k = Buffer.alloc(n * 4);
+  for (let i = 0; i < n * 2; i++) {
+    let s = Math.round(filtered[i]);
+    if (s > 32767) s = 32767;
+    if (s < -32768) s = -32768;
+    pcm16k.writeInt16LE(s, i * 2);
   }
   return pcm16k;
 }
@@ -388,6 +421,9 @@ async function main() {
     }
   };
   
+  // Gate: only forward audio to Gemini after meeting is joined
+  let inMeeting = false;
+  
   // Telnyx media WebSocket — bridge audio to/from Gemini
   wss.on('connection', (ws) => {
     console.log('🔌 Telnyx media stream connected');
@@ -414,6 +450,16 @@ async function main() {
       }
     };
     
+    let audioChunks = 0;
+    let peakLevel = 0;
+    let levelLogTimer = setInterval(() => {
+      if (audioChunks > 0) {
+        console.log(`🎚️ Audio: ${audioChunks} chunks, peak=${peakLevel}, ${peakLevel < 500 ? '⚠️ LOW' : '✅ OK'}`);
+        audioChunks = 0;
+        peakLevel = 0;
+      }
+    }, 5000);
+    
     ws.on('message', (data) => {
       try {
         const msg = JSON.parse(data);
@@ -421,11 +467,22 @@ async function main() {
           // Audio from Zoom → convert µ-law 8kHz to PCM 16kHz → Gemini
           const ulawBuf = Buffer.from(msg.media.payload, 'base64');
           const pcm16k = ulawToPcm16k(ulawBuf);
+          
+          // Track audio levels for debugging
+          audioChunks++;
+          for (let i = 0; i < pcm16k.length; i += 2) {
+            const s = Math.abs(pcm16k.readInt16LE(i));
+            if (s > peakLevel) peakLevel = s;
+          }
+          
+          // Only send audio to Gemini after we've joined the meeting
+          if (!inMeeting) return;
           gemini.sendAudio(pcm16k);
         } else if (msg.event === 'start') {
           console.log('🎵 Media stream started');
         } else if (msg.event === 'stop') {
           console.log('🎵 Media stream stopped');
+          clearInterval(levelLogTimer);
         }
       } catch {}
     });
@@ -515,13 +572,16 @@ async function main() {
   s = await telnyxApi('GET', `/calls/${callControlId}`);
   if (!s.data?.is_alive) { console.log('❌ Dead'); cleanup(tunnel, gemini); return; }
   
-  console.log('🎉 IN THE MEETING — Gemini Live handling audio\n');
+  inMeeting = true;
+  // Reset resampler state so Gemini gets clean audio from here
+  _resampleCarry = new Float64Array(LP_TAPS.length);
+  console.log('🎉 IN THE MEETING — Gemini Live handling audio (audio gate OPEN)\n');
   
   // Restart media streaming (it often closes during DTMF/IVR phase)
   try {
     await telnyxApi('POST', `/calls/${callControlId}/actions/streaming_start`, {
       stream_url: `wss://${tunnel.url.replace('https://', '')}/media`,
-      stream_track: 'inbound_track',
+      stream_track: 'both_tracks',
     });
     console.log('🎵 Media streaming restarted');
   } catch (err) {
