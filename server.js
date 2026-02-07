@@ -175,6 +175,18 @@ function handleRetellConnection(ws, callId, metadata) {
   // Don't send greeting during IVR - wait until connected
   let greetingSent = false;
   
+  // CRITICAL: Send initial message when WebSocket connects
+  // Retell requires this to start the conversation
+  // Empty content = agent waits for user to speak first (good for IVR)
+  const initialMessage = {
+    response_id: 0,
+    content: '',  // Empty = stay silent during IVR
+    content_complete: true,
+    end_call: false
+  };
+  ws.send(JSON.stringify(initialMessage));
+  console.log(`[${callId}] Sent initial message (silent for IVR)`);
+  
   // Handle messages from Retell
   ws.on('message', async (data) => {
     try {

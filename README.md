@@ -1,173 +1,115 @@
-# OpenClaw Zoom Agent
+# 🦞 OpenClaw Zoom Agent
 
-An AI-powered meeting participant that joins Zoom calls via phone and participates conversationally, with OpenClaw as the brain.
+AI voice agent that joins Zoom meetings via PSTN dial-in. Listens, transcribes, and speaks with AI-generated responses.
 
-## Architecture
+## How It Works
 
 ```
-┌──────────────┐     ┌─────────────┐     ┌─────────────┐     ┌──────────┐
-│     Zoom     │◀───▶│   Retell    │◀───▶│  This App   │◀───▶│ LLM API  │
-│   Meeting    │     │ (voice I/O) │     │ (brain)     │     │(GPT-4/etc)│
-└──────────────┘     └─────────────┘     └─────────────┘     └──────────┘
-      PSTN            STT + TTS          WebSocket Server      OpenRouter
+You → "Join my Zoom" → Agent dials Zoom PSTN → DTMF joins meeting
+                      → Live transcription via Telnyx webhooks
+                      → AI responses via GPT-4o-mini → Telnyx TTS
 ```
-
-**How it works:**
-1. Retell AI dials into Zoom's PSTN number
-2. This server handles conversation logic (IVR navigation + meeting participation)
-3. The LLM (via OpenRouter) provides intelligent responses
-4. Retell converts text to speech and speaks in the meeting
-
-## Features
-
-- 🎯 **IVR Navigation**: Automatically enters meeting ID and passcode via DTMF
-- 🧠 **OpenClaw-powered**: Uses GPT-4o (or any OpenRouter model) as the brain
-- 🗣️ **Natural conversation**: Participates like a human colleague
-- 📞 **Phone dial-in**: Works with any Zoom meeting that has PSTN dial-in
-
-## Prerequisites
-
-1. **Retell AI Account** - [Sign up](https://retellai.com)
-   - API key
-   - Phone number (via Telnyx or Twilio)
-
-2. **OpenRouter API Key** - [Get one](https://openrouter.ai)
-   - For LLM access (GPT-4o, Claude, etc.)
-
-3. **Public URL** - For Retell to connect to your WebSocket server
-   - ngrok, localtunnel, or deploy to cloud
 
 ## Quick Start
 
-### 1. Install dependencies
-
 ```bash
+# 1. Install dependencies
 npm install
-```
 
-### 2. Configure environment
-
-```bash
+# 2. Copy and fill in your credentials
 cp .env.example .env
-# Edit .env with your keys
+
+# 3. Join a meeting
+node m3-voice-agent.js -m 83914076399 -p 953856
 ```
 
-### 3. Start the server
+## CLI Options
 
-```bash
-npm start
+```
+node m3-voice-agent.js [options]
+
+  -m, --meeting-id <id>     Zoom meeting ID (required)
+  -p, --passcode <code>     Meeting passcode
+  -d <seconds>              Max duration (default: 600)
 ```
 
-### 4. Expose publicly (for local development)
-
-```bash
-# Using localtunnel
-npx localtunnel --port 8080
-
-# Or using ngrok
-ngrok http 8080
-```
-
-### 5. Configure Retell Agent
-
-Create an agent in Retell dashboard with:
-- **Response Engine**: Custom LLM
-- **LLM WebSocket URL**: `wss://your-tunnel-url.com/llm-websocket`
-
-### 6. Join a meeting
-
-```bash
-./cli.sh join --meeting-id 12345678901 --passcode 123456
-```
-
-## Environment Variables
+### Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENROUTER_API_KEY` | Yes | OpenRouter API key for LLM access |
-| `MODEL` | No | LLM model (default: `openai/gpt-4o`) |
-| `PORT` | No | Server port (default: `8080`) |
+| `TELNYX_API_KEY` | ✅ | Telnyx API key |
+| `TELNYX_DID` | ✅ | Your Telnyx phone number |
+| `TELNYX_CONNECTION_ID` | ✅ | Call control application ID |
+| `OPENAI_API_KEY` | ✅ | OpenAI API key (for GPT responses) |
+| `ZOOM_DIAL_IN` | | Zoom dial-in number (default: +16699009128) |
+| `AGENT_NAME` | | Display name (default: "AI Assistant") |
+| `AGENT_ROLE` | | Role description |
+| `AGENT_INSTRUCTIONS` | | Custom system prompt |
+| `BUFFER_DELAY` | | Ms to wait before responding (default: 1500) |
+| `NO_SPEAK` | | Set to "true" for listen-only mode |
+| `TRANSCRIPT_FILE` | | Path to save transcript after call |
 
-## CLI Usage
+## Architecture
 
-```bash
-# Join a meeting
-./cli.sh join --meeting-id 12345678901 --passcode 123456
+### Files
 
-# Join from Zoom link
-./cli.sh join --link "https://zoom.us/j/12345678901" --passcode 654321
+| File | Purpose |
+|------|---------|
+| `m3-voice-agent.js` | **Main agent** — full voice loop (transcribe + respond + speak) |
+| `m2-live-transcribe.js` | Transcription-only mode (no AI responses) |
+| `bridge.js` | WebSocket bridge (requires public URL for media streaming) |
+| `server.js` | Legacy Retell AI integration |
 
-# Specify who the agent represents
-./cli.sh join -m 12345678901 -p 123456 --name "John"
+### Flow
 
-# Check call status
-./cli.sh status <call_id>
+1. **Dial** — Telnyx PSTN call to Zoom dial-in number
+2. **Join** — DTMF sequence: meeting ID → skip participant ID → passcode
+3. **Tunnel** — ngrok exposes local webhook server for Telnyx events
+4. **Transcribe** — Telnyx real-time transcription (Engine B)
+5. **Think** — GPT-4o-mini generates response from transcript
+6. **Speak** — Telnyx TTS speaks response into the call
 
-# End a call
-./cli.sh end <call_id>
-```
+### Timing
 
-## Configuration
+- ~15s for Zoom IVR greeting
+- ~13s for DTMF sequence (meeting ID + passcode)
+- ~1.5s buffer before responding (configurable)
+- Total join time: ~30s
 
-### Retell Agent Settings
+## Requirements
 
-Recommended settings for the Retell agent:
+- Node.js 18+
+- [ngrok](https://ngrok.com/) installed and authenticated
+- Telnyx account with:
+  - A phone number (DID)
+  - Call control application (outbound channel limit ≥ 2)
+- OpenAI API key
 
-```json
-{
-  "voice_id": "11labs-Adrian",
-  "voice_temperature": 0.8,
-  "voice_speed": 1.0,
-  "responsiveness": 0.8,
-  "interruption_sensitivity": 0.7,
-  "enable_backchannel": true,
-  "backchannel_words": ["uh-huh", "I see", "right", "okay", "got it"],
-  "max_call_duration_ms": 7200000
-}
-```
+## Telnyx Setup
 
-### Supported LLM Models
+1. Create a [Call Control Application](https://portal.telnyx.com/#/app/call-control/applications)
+2. Set outbound channel limit to at least 2
+3. Assign your phone number to the application
+4. Note the connection ID — that's your `TELNYX_CONNECTION_ID`
 
-Via OpenRouter, you can use:
-- `openai/gpt-4o` (default, recommended)
-- `openai/gpt-4o-mini` (faster, cheaper)
-- `anthropic/claude-3.5-sonnet` (alternative)
-- Any model on [OpenRouter](https://openrouter.ai/models)
+The webhook URL is set dynamically at runtime via the API (no manual config needed).
 
-## Costs
+## Language Support
 
-| Component | Cost |
-|-----------|------|
-| Retell (voice + STT/TTS) | ~$0.10-0.15/min |
-| OpenRouter (GPT-4o) | ~$0.01-0.03/min |
-| **Total** | **~$0.12-0.18/min** |
+The agent responds in the same language the speaker uses:
+- English → English response
+- Chinese (Mandarin) → Chinese response
+- Mixed → dominant language
 
-For a 1-hour meeting: ~$7-11
+Telnyx TTS supports `en-US` and `cmn-CN` voices.
 
 ## Limitations
 
-1. **Audio only** - Cannot see screen shares or video
-2. **Zoom dial-in required** - Meeting must have PSTN dial-in enabled
-3. **Host must be present** - Or waiting room must be disabled
-4. **English focused** - IVR detection optimized for English Zoom prompts
-
-## Development
-
-```bash
-# Start with auto-reload
-npm run dev
-
-# Test WebSocket locally
-wscat -c ws://localhost:8080/llm-websocket
-```
+- **Voice quality**: Telnyx basic TTS (robotic). Upgrade path: OpenAI TTS → audio streaming.
+- **Latency**: ~2-4s round-trip (transcription + GPT + TTS). Reducible with streaming.
+- **One call per instance**: Run multiple instances for concurrent meetings.
+- **PSTN only**: No Zoom SDK integration (yet). Phone audio quality.
 
 ## License
 
 MIT
-
-## Credits
-
-Built with:
-- [Retell AI](https://retellai.com) - Voice infrastructure
-- [OpenRouter](https://openrouter.ai) - LLM routing
-- [OpenClaw](https://openclaw.ai) - AI agent framework
