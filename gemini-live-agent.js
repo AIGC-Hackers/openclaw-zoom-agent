@@ -390,9 +390,32 @@ async function main() {
   gemini.onFunctionCall = async (name, args) => {
     if (name === 'ask_assistant') {
       console.log(`🧠 Asking OpenClaw: "${args.query}"`);
-      // TODO: Route to OpenClaw via sessions_send API
-      // For now, return a placeholder
-      return `I'll help with that. Let me check... (OpenClaw integration pending)`;
+      const OPENCLAW_GATEWAY = process.env.OPENCLAW_GATEWAY || 'http://localhost:18789';
+      const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
+      try {
+        const res = await fetch(`${OPENCLAW_GATEWAY}/api/sessions/send`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(OPENCLAW_TOKEN ? { 'Authorization': `Bearer ${OPENCLAW_TOKEN}` } : {}),
+          },
+          body: JSON.stringify({
+            message: args.query,
+            label: 'zoom-agent-brain',
+            timeoutSeconds: 15,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const reply = data?.reply || data?.message || 'No response from brain.';
+          console.log(`🧠 OpenClaw replied: "${reply.slice(0, 80)}..."`);
+          return reply;
+        }
+        console.log(`⚠️ OpenClaw HTTP ${res.status}`);
+      } catch (err) {
+        console.log(`⚠️ OpenClaw brain error: ${err.message}`);
+      }
+      return `I'm not sure about that right now. Let me get back to you.`;
     }
     return 'Unknown function';
   };

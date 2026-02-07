@@ -48,6 +48,9 @@ node m3-voice-agent.js [options]
 | `BUFFER_DELAY` | | Ms to wait before responding (default: 1500) |
 | `NO_SPEAK` | | Set to "true" for listen-only mode |
 | `TRANSCRIPT_FILE` | | Path to save transcript after call |
+| `USE_OPENCLAW_BRAIN` | | Set to "true" to route responses via OpenClaw gateway |
+| `OPENCLAW_GATEWAY` | | OpenClaw gateway URL (default: http://localhost:18789) |
+| `OPENCLAW_TOKEN` | | OpenClaw API token (if auth enabled) |
 
 ## Architecture
 
@@ -57,6 +60,7 @@ node m3-voice-agent.js [options]
 |------|---------|
 | `m3-voice-agent.js` | **Main agent** — full voice loop (transcribe + respond + speak) |
 | `m2-live-transcribe.js` | Transcription-only mode (no AI responses) |
+| `gemini-live-agent.js` | Gemini Live API integration (experimental — audio bridge WIP) |
 | `bridge.js` | WebSocket bridge (requires public URL for media streaming) |
 | `server.js` | Legacy Retell AI integration |
 
@@ -66,7 +70,7 @@ node m3-voice-agent.js [options]
 2. **Join** — DTMF sequence: meeting ID → skip participant ID → passcode
 3. **Tunnel** — ngrok exposes local webhook server for Telnyx events
 4. **Transcribe** — Telnyx real-time transcription (Engine B)
-5. **Think** — GPT-4o-mini generates response from transcript
+5. **Think** — OpenClaw brain (if enabled) or GPT-4o-mini generates response
 6. **Speak** — Telnyx TTS speaks response into the call
 
 ### Timing
