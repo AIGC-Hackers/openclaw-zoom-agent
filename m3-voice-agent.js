@@ -65,7 +65,7 @@ async function askOpenClawBrain(text) {
 }
 
 // --- Telnyx REST (with retry) ---
-async function api(method, path, body, retries = 3) {
+async function api(method, path, body, retries = 5) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(`${BASE}${path}`, {
@@ -102,15 +102,26 @@ const AGENT_INSTRUCTIONS = process.env.AGENT_INSTRUCTIONS || '';
 const NO_SPEAK = process.env.NO_SPEAK === 'true';
 const TRANSCRIPT_FILE = process.env.TRANSCRIPT_FILE || '';
 
-const systemPrompt = AGENT_INSTRUCTIONS || `You are ${AGENT_NAME}, ${AGENT_ROLE}, joining a Zoom meeting.
-You are professional, helpful, and concise. Keep responses to 1-2 sentences max.
-You MUST respond in the SAME LANGUAGE the speaker used:
-- If they speak Chinese (Mandarin), respond in Chinese.
-- If they speak English, respond in English.
-- If they mix, use the dominant language of their last message.
-This is critical — never respond in English when the speaker used Chinese, and vice versa.
-If someone greets you or asks who you are, introduce yourself as ${AGENT_NAME}, ${AGENT_ROLE}.
-If asked to do something, acknowledge and be helpful.`;
+const systemPrompt = AGENT_INSTRUCTIONS || `You are ${AGENT_NAME}, ${AGENT_ROLE}, participating in a Zoom meeting via phone.
+
+CORE RULES:
+- Keep responses to 1-3 sentences max. You're speaking on a phone call — be concise.
+- ALWAYS respond in the SAME LANGUAGE the speaker used (English → English, Chinese → Chinese).
+- Be conversational and natural. Don't sound robotic.
+- If someone greets you or asks who you are, introduce yourself briefly as ${AGENT_NAME}.
+
+ABOUT OPENCLAW (your knowledge):
+- OpenClaw is an open-source AI personal assistant platform (24/7, self-hosted).
+- It connects to WhatsApp, Telegram, Discord, Slack, iMessage, Signal, and more.
+- It runs locally on your own hardware (Mac, Linux, Raspberry Pi) — your data stays private.
+- Key features: multi-agent system, voice calls, scheduled automations (cron), skills ecosystem, memory system.
+- Website: openclawai.io | Docs: docs.openclaw.ai | GitHub: github.com/openclaw
+- Founded by Kai. Community on Discord.
+- Pricing: Free and open-source. Users bring their own API keys.
+- Competitors: ChatGPT (cloud-only), Lindy AI (cloud SaaS), custom GPTs (limited).
+- Unique value: runs locally, connects to real messaging apps, multi-agent collaboration, voice integration.
+
+If asked about topics you don't know, say so honestly. Don't make things up.`;
 
 const conversationHistory = [
   { role: 'system', content: systemPrompt }
@@ -255,7 +266,7 @@ async function speakText(text) {
   try {
     await api('POST', `/calls/${callControlId}/actions/speak`, {
       payload: text,
-      voice: 'male',
+      voice: isChinese ? 'female' : 'male',
       language: isChinese ? 'cmn-CN' : 'en-US',
     });
     console.log(`🔊 Speaking: "${text.slice(0, 60)}..."`);
@@ -369,25 +380,26 @@ async function main() {
   isInMeeting = true;
   console.log('🎉 IN THE MEETING!');
 
-  // Start transcription (bilingual)
-  console.log('🎤 Starting transcription...');
+  // Start transcription
+  // STT_LANGUAGE env: 'en' for English, 'zh' for Chinese, default 'en'
+  const sttLang = process.env.STT_LANGUAGE || 'en';
+  console.log(`🎤 Starting transcription (language: ${sttLang})...`);
   try {
     await api('POST', `/calls/${callControlId}/actions/transcription_start`, {
-      language: 'en',
+      language: sttLang,
       transcription_engine: 'B',
       transcription_tracks: 'inbound',
     });
-    console.log('🎤 Transcription active\n');
+    console.log(`🎤 Transcription active (Engine B/Whisper, lang=${sttLang})\n`);
   } catch (err) {
     console.error('⚠️ Engine B failed, trying A:', err.message);
     try {
       await api('POST', `/calls/${callControlId}/actions/transcription_start`, {
-        language: 'en',
+        language: sttLang,
         transcription_engine: 'A',
         transcription_tracks: 'inbound',
-        interim_results: false,
       });
-      console.log('🎤 Transcription active (engine A)\n');
+      console.log(`🎤 Transcription active (Engine A/Google, lang=${sttLang})\n`);
     } catch (err2) {
       console.error('❌ Both engines failed:', err2.message);
     }

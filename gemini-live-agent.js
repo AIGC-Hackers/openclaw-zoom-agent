@@ -18,6 +18,7 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { spawn } from 'child_process';
+import { writeFileSync } from 'fs';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -47,7 +48,7 @@ const AGENT_NAME = process.env.AGENT_NAME || 'AI Assistant';
 const AGENT_ROLE = process.env.AGENT_ROLE || "Kai's AI assistant";
 
 // --- Telnyx REST (with retry) ---
-async function telnyxApi(method, path, body, retries = 3) {
+async function telnyxApi(method, path, body, retries = 5) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(`${TELNYX_BASE}${path}`, {
@@ -101,52 +102,23 @@ function pcmToUlaw(sample) {
   return ~(sign | (exponent << 4) | mantissa) & 0xFF;
 }
 
-// Convert µ-law 8kHz buffer to PCM 16kHz with proper resampling
-// Uses zero-stuffing + simple FIR low-pass filter to avoid aliasing
-const LP_TAPS = [0.025, 0.075, 0.15, 0.25, 0.25, 0.15, 0.075, 0.025]; // 8-tap LPF
-let _resampleCarry = new Float64Array(LP_TAPS.length); // state between chunks
+// Convert µ-law 8kHz buffer to PCM 16kHz (linear interpolation with cross-chunk carry)
+let _lastSample = 0; // carry last sample across chunks to avoid boundary clicks
 
 function ulawToPcm16k(ulawBuf) {
   const n = ulawBuf.length;
-  const upsampled = new Float64Array(n * 2); // zero-stuffed
+  const pcm16k = Buffer.alloc(n * 4); // 2x samples, 2 bytes each
   
-  // Decode µ-law and zero-stuff (insert zero between each sample)
   for (let i = 0; i < n; i++) {
-    upsampled[i * 2] = ULAW_DECODE[ulawBuf[i]] * 2.0; // gain compensation for zero-stuffing
-    upsampled[i * 2 + 1] = 0;
+    const s1 = ULAW_DECODE[ulawBuf[i]];
+    // For interpolated sample: use previous sample (cross-chunk for i=0)
+    const prev = (i > 0) ? ULAW_DECODE[ulawBuf[i - 1]] : _lastSample;
+    // Interpolated sample between prev and current
+    pcm16k.writeInt16LE(((prev + s1) >> 1), i * 4);
+    // Original sample
+    pcm16k.writeInt16LE(s1, i * 4 + 2);
   }
-  
-  // Apply FIR low-pass filter to smooth interpolation
-  const filtered = new Float64Array(n * 2);
-  const carry = _resampleCarry;
-  const taps = LP_TAPS;
-  const tl = taps.length;
-  
-  for (let i = 0; i < n * 2; i++) {
-    let sum = 0;
-    for (let t = 0; t < tl; t++) {
-      const si = i - t;
-      const val = si >= 0 ? upsampled[si] : carry[carry.length + si] || 0;
-      sum += val * taps[t];
-    }
-    filtered[i] = sum;
-  }
-  
-  // Save last samples as carry for next chunk continuity
-  const carryStart = Math.max(0, n * 2 - tl);
-  for (let i = 0; i < tl; i++) {
-    const si = carryStart + i;
-    _resampleCarry[i] = si < n * 2 ? upsampled[si] : 0;
-  }
-  
-  // Convert to 16-bit PCM buffer with clipping
-  const pcm16k = Buffer.alloc(n * 4);
-  for (let i = 0; i < n * 2; i++) {
-    let s = Math.round(filtered[i]);
-    if (s > 32767) s = 32767;
-    if (s < -32768) s = -32768;
-    pcm16k.writeInt16LE(s, i * 2);
-  }
+  _lastSample = ULAW_DECODE[ulawBuf[n - 1]];
   return pcm16k;
 }
 
@@ -475,11 +447,40 @@ async function main() {
     
     let audioChunks = 0;
     let peakLevel = 0;
+    // Audio diagnostic: dump first 10s of PCM to WAV for inspection
+    const diagBufs = [];
+    let diagSamples = 0;
+    const DIAG_MAX = 16000 * 10; // 10 seconds at 16kHz
+    let diagSaved = false;
+    
     let levelLogTimer = setInterval(() => {
       if (audioChunks > 0) {
         console.log(`🎚️ Audio: ${audioChunks} chunks, peak=${peakLevel}, ${peakLevel < 500 ? '⚠️ LOW' : '✅ OK'}`);
         audioChunks = 0;
         peakLevel = 0;
+      }
+      // Save diagnostic WAV after collecting enough samples
+      if (!diagSaved && diagSamples >= DIAG_MAX) {
+        diagSaved = true;
+        const pcmData = Buffer.concat(diagBufs);
+        const wavHeader = Buffer.alloc(44);
+        const dataSize = pcmData.length;
+        wavHeader.write('RIFF', 0);
+        wavHeader.writeUInt32LE(36 + dataSize, 4);
+        wavHeader.write('WAVE', 8);
+        wavHeader.write('fmt ', 12);
+        wavHeader.writeUInt32LE(16, 16); // chunk size
+        wavHeader.writeUInt16LE(1, 20); // PCM
+        wavHeader.writeUInt16LE(1, 22); // mono
+        wavHeader.writeUInt32LE(16000, 24); // sample rate
+        wavHeader.writeUInt32LE(32000, 28); // byte rate
+        wavHeader.writeUInt16LE(2, 32); // block align
+        wavHeader.writeUInt16LE(16, 34); // bits per sample
+        wavHeader.write('data', 36);
+        wavHeader.writeUInt32LE(dataSize, 40);
+        writeFileSync('diag-gemini-input.wav', Buffer.concat([wavHeader, pcmData]));
+        console.log(`🔬 DIAGNOSTIC: Saved ${(dataSize/32000).toFixed(1)}s of audio to diag-gemini-input.wav`);
+        diagBufs.length = 0; // free memory
       }
     }, 5000);
     
@@ -487,6 +488,10 @@ async function main() {
       try {
         const msg = JSON.parse(data);
         if (msg.event === 'media' && msg.media?.track === 'inbound') {
+          // Log first media message structure
+          if (audioChunks === 0) {
+            console.log(`🔬 First media msg: track=${msg.media.track} chunk=${msg.media.chunk} encoding=${msg.media.encoding || 'unknown'} payload_len=${msg.media.payload?.length || 0}`);
+          }
           // Audio from Zoom → convert µ-law 8kHz to PCM 16kHz → Gemini
           const ulawBuf = Buffer.from(msg.media.payload, 'base64');
           const pcm16k = ulawToPcm16k(ulawBuf);
@@ -500,6 +505,16 @@ async function main() {
           
           // Only send audio to Gemini after we've joined the meeting
           if (!inMeeting) return;
+          
+          // Echo suppression: don't feed Gemini while agent is speaking (its own TTS loops back)
+          if (isSpeaking) return;
+          
+          // Collect diagnostic audio
+          if (diagSamples < DIAG_MAX) {
+            diagBufs.push(Buffer.from(pcm16k));
+            diagSamples += pcm16k.length / 2;
+          }
+          
           gemini.sendAudio(pcm16k);
         } else if (msg.event === 'start') {
           console.log('🎵 Media stream started');
@@ -547,9 +562,19 @@ async function main() {
     });
   }
   
-  console.log('🔗 Connecting to Gemini Live API...');
-  await gemini.connect();
-  console.log('✅ Gemini Live ready');
+  // Connect to Gemini with retry (WS can fail on first attempt)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      console.log(`🔗 Connecting to Gemini Live API (attempt ${attempt})...`);
+      await gemini.connect();
+      console.log('✅ Gemini Live ready');
+      break;
+    } catch (err) {
+      console.log(`⚠️ Gemini connect failed: ${err.message}`);
+      if (attempt === 3) { console.log('❌ Giving up'); cleanup(tunnel, gemini); return; }
+      await sleep(3000);
+    }
+  }
   
   // Dial Zoom
   console.log(`\n📞 Dialing Zoom ${meetingId}...`);
@@ -596,8 +621,6 @@ async function main() {
   if (!s.data?.is_alive) { console.log('❌ Dead'); cleanup(tunnel, gemini); return; }
   
   inMeeting = true;
-  // Reset resampler state so Gemini gets clean audio from here
-  _resampleCarry = new Float64Array(LP_TAPS.length);
   console.log('🎉 IN THE MEETING — Gemini Live handling audio (audio gate OPEN)\n');
   
   // Restart media streaming (it often closes during DTMF/IVR phase)
