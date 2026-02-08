@@ -29,39 +29,23 @@ if (!meetingId) {
   process.exit(1);
 }
 
-// --- OpenAI client ---
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// --- OpenClaw brain integration ---
+// --- AI client (OpenAI or OpenClaw gateway) ---
+const USE_OPENCLAW_BRAIN = process.env.USE_OPENCLAW_BRAIN === 'true';
 const OPENCLAW_GATEWAY = process.env.OPENCLAW_GATEWAY || 'http://localhost:18789';
 const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
-const USE_OPENCLAW_BRAIN = process.env.USE_OPENCLAW_BRAIN === 'true';
+const OPENCLAW_AGENT = process.env.OPENCLAW_AGENT || 'main';
 
-async function askOpenClawBrain(text) {
-  if (!USE_OPENCLAW_BRAIN) return null;
-  try {
-    const res = await fetch(`${OPENCLAW_GATEWAY}/api/sessions/send`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(OPENCLAW_TOKEN ? { 'Authorization': `Bearer ${OPENCLAW_TOKEN}` } : {}),
-      },
-      body: JSON.stringify({
-        message: `[Zoom Meeting Context] Someone in the meeting said: "${text}"\n\nProvide a brief, helpful response (1-2 sentences max). Respond in the same language they used.`,
-        label: 'zoom-agent-brain',
-        timeoutSeconds: 15,
-      }),
-    });
-    if (!res.ok) {
-      console.log(`⚠️ OpenClaw brain HTTP ${res.status}`);
-      return null;
-    }
-    const data = await res.json();
-    return data?.reply || data?.message || null;
-  } catch (err) {
-    console.log(`⚠️ OpenClaw brain error: ${err.message}`);
-    return null;
-  }
+const openai = USE_OPENCLAW_BRAIN
+  ? new OpenAI({
+      apiKey: OPENCLAW_TOKEN,
+      baseURL: `${OPENCLAW_GATEWAY}/v1`,
+    })
+  : new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+if (USE_OPENCLAW_BRAIN) {
+  console.log(`🧠 Using OpenClaw brain (agent: ${OPENCLAW_AGENT}) at ${OPENCLAW_GATEWAY}`);
+} else {
+  console.log('🧠 Using GPT-4o-mini (standalone)');
 }
 
 // --- Telnyx REST (with retry) ---
@@ -108,6 +92,8 @@ CORE RULES:
 - Keep responses to 1-3 sentences max. You're speaking on a phone call — be concise.
 - ALWAYS respond in the SAME LANGUAGE the speaker used (English → English, Chinese → Chinese).
 - Be conversational and natural. Don't sound robotic.
+- NEVER use markdown formatting (no **, *, #, bullets, numbered lists, code blocks). Your output goes directly to TTS.
+- NEVER use emojis. Plain text only.
 - If someone greets you or asks who you are, introduce yourself briefly as ${AGENT_NAME}.
 
 ABOUT OPENCLAW (your knowledge):
@@ -204,6 +190,30 @@ app.post('/speak', async (req, res) => {
 
 const server = createServer(app);
 
+// --- Hybrid routing: classify if question needs tools ---
+const BRAIN_PATTERNS = [
+  // Real-time data
+  /天气|weather|forecast|温度/i,
+  /最新|latest|recent|新闻|news|trending/i,
+  /搜索|search|查[一找]|look up|google/i,
+  // Tool access
+  /project|项目|kanban|workspace|agent|marcus|alex|ethan|leo|noah|monk|pica/i,
+  /calendar|日历|日程|schedule|meeting/i,
+  /email|邮件|inbox/i,
+  /notion|github|slack|discord/i,
+  /网站|website|openclawai|fansite/i,
+  // Complex reasoning that benefits from full agent
+  /分析|analyze|compare|对比|评估|assess/i,
+  /帮我|help me|can you.*find|能不能.*找/i,
+];
+
+function needsBrain(text) {
+  return USE_OPENCLAW_BRAIN && BRAIN_PATTERNS.some(p => p.test(text));
+}
+
+// --- Fast GPT-4o-mini client (always available) ---
+const fastLLM = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 // --- Process accumulated transcript and generate response ---
 async function processAndRespond() {
   if (!transcriptBuffer.trim() || !isInMeeting || isSpeaking) return;
@@ -214,40 +224,72 @@ async function processAndRespond() {
   // Skip very short fragments or noise
   if (userText.length < 5) return;
   
-  console.log(`\n🧠 Processing: "${userText}"`);
+  const useBrain = needsBrain(userText);
+  console.log(`\n🧠 Processing: "${userText}" [${useBrain ? 'BRAIN' : 'FAST'}]`);
   
   try {
-    conversationHistory.push({ role: 'user', content: userText });
+    if (useBrain) {
+      // Route to OpenClaw Brain for complex queries needing tools
+      const brainMessage = `[ZOOM MEETING VOICE CALL] Someone said: "${userText}"\n\nRespond in 1-2 sentences. Plain text only — NO markdown, NO emojis, NO formatting. This goes directly to text-to-speech. Respond in the same language they used.`;
+      conversationHistory.push({ role: 'user', content: brainMessage });
+    } else {
+      conversationHistory.push({ role: 'user', content: userText });
+    }
     
     // Keep history manageable
     if (conversationHistory.length > 20) {
       conversationHistory.splice(1, conversationHistory.length - 11);
     }
     
-    let response = null;
+    const timeoutMs = useBrain ? 25000 : 8000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     
-    // Try OpenClaw brain first (if enabled)
-    if (USE_OPENCLAW_BRAIN) {
-      console.log('🧠 Asking OpenClaw brain...');
-      response = await askOpenClawBrain(userText);
-      if (response) console.log('🧠 OpenClaw brain responded');
+    let response;
+    try {
+      if (useBrain) {
+        // OpenClaw Brain (Claude Opus + tools)
+        const completion = await openai.chat.completions.create({
+          model: `openclaw:${OPENCLAW_AGENT}`,
+          messages: conversationHistory,
+          max_tokens: 200,
+          temperature: 0.7,
+          user: 'zoom-meeting-agent',
+        }, { signal: controller.signal });
+        response = completion.choices[0]?.message?.content;
+      } else {
+        // Fast path: GPT-4o-mini (no tools, ~1-2s)
+        const completion = await fastLLM.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: conversationHistory,
+          max_tokens: 150,
+          temperature: 0.7,
+        }, { signal: controller.signal });
+        response = completion.choices[0]?.message?.content;
+      }
+    } catch (err) {
+      if (err.name === 'AbortError' || err.message?.includes('abort')) {
+        console.log(`⏱️ ${useBrain ? 'Brain' : 'Fast'} timeout, falling back to GPT-4o-mini`);
+        const completion = await fastLLM.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: conversationHistory,
+          max_tokens: 150,
+          temperature: 0.7,
+        });
+        response = completion.choices[0]?.message?.content;
+      } else {
+        throw err;
+      }
+    } finally {
+      clearTimeout(timer);
     }
     
-    // Fall back to GPT-4o-mini
-    if (!response) {
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: conversationHistory,
-        max_tokens: 150,
-        temperature: 0.7,
-      });
-      response = completion.choices[0]?.message?.content;
-    }
-    
-    if (response) {
+    if (response && !response.includes('No response from OpenClaw')) {
       conversationHistory.push({ role: 'assistant', content: response });
       console.log(`💬 Response: "${response}"`);
       await speakText(response);
+    } else {
+      console.log(`💬 Response: "${response || '(empty)'}"`);
     }
   } catch (err) {
     console.error('🧠 AI error:', err.message);
@@ -255,8 +297,30 @@ async function processAndRespond() {
 }
 
 // --- TTS via Telnyx speak command ---
+// Strip markdown/emoji for clean TTS
+function cleanForTTS(text) {
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')   // **bold** → bold
+    .replace(/\*([^*]+)\*/g, '$1')        // *italic* → italic
+    .replace(/__([^_]+)__/g, '$1')        // __underline__
+    .replace(/_([^_]+)_/g, '$1')          // _italic_
+    .replace(/~~([^~]+)~~/g, '$1')        // ~~strikethrough~~
+    .replace(/`([^`]+)`/g, '$1')          // `code`
+    .replace(/```[\s\S]*?```/g, '')       // code blocks
+    .replace(/^#{1,6}\s+/gm, '')          // # headers
+    .replace(/^[-*+]\s+/gm, '')           // bullet points
+    .replace(/^\d+\.\s+/gm, '')           // numbered lists
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // [link](url) → link
+    .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, '') // all emojis
+    .replace(/\n{3,}/g, '\n\n')           // collapse multiple newlines
+    .trim();
+}
+
 async function speakText(text) {
   if (!callControlId || isSpeaking) return;
+  
+  text = cleanForTTS(text);
+  if (!text) return;
   
   isSpeaking = true;
   
