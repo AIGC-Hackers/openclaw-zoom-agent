@@ -150,12 +150,27 @@ app.post('/webhook', async (req, res) => {
         console.log(`\n🎤 [${entry.time}] ${entry.text}`);
         
         // Accumulate transcript and set response timer
+        // LISTEN_ONLY mode: only respond when trigger word is mentioned
+        const LISTEN_ONLY = process.env.LISTEN_ONLY === 'true';
+        const TRIGGER_WORDS = /pica|助手|ai\s*assistant|请你|ask you|hey ai|请回答|你说说|你觉得|你认为|你来/i;
+        
         if (isInMeeting && !isSpeaking && !NO_SPEAK) {
           transcriptBuffer += (transcriptBuffer ? ' ' : '') + text.trim();
           
-          // Reset the buffer timer
-          if (bufferTimer) clearTimeout(bufferTimer);
-          bufferTimer = setTimeout(() => processAndRespond(), BUFFER_DELAY);
+          if (LISTEN_ONLY && !TRIGGER_WORDS.test(transcriptBuffer)) {
+            // Silent mode — just log, don't respond
+            if (bufferTimer) clearTimeout(bufferTimer);
+            bufferTimer = setTimeout(() => {
+              if (transcriptBuffer.trim()) {
+                console.log(`👂 [listen] ${transcriptBuffer.trim()}`);
+                transcriptBuffer = '';
+              }
+            }, BUFFER_DELAY);
+          } else {
+            // Reset the buffer timer
+            if (bufferTimer) clearTimeout(bufferTimer);
+            bufferTimer = setTimeout(() => processAndRespond(), BUFFER_DELAY);
+          }
         }
       } else if (text && text.trim() && !isFinal) {
         process.stdout.write(`\r  💭 ${text.trim().slice(0, 80)}...`);
