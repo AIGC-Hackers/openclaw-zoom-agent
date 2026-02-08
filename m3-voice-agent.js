@@ -185,6 +185,7 @@ app.post('/webhook', async (req, res) => {
     case 'call.speak.ended':
       console.log('🔊 Speaking ended');
       isSpeaking = false;
+      if (speakingSafetyTimer) { clearTimeout(speakingSafetyTimer); speakingSafetyTimer = null; }
       break;
       
     case 'call.hangup':
@@ -340,6 +341,8 @@ function cleanForTTS(text) {
     .trim();
 }
 
+let speakingSafetyTimer = null;
+
 async function speakText(text) {
   if (!callControlId || isSpeaking) return;
   
@@ -347,6 +350,19 @@ async function speakText(text) {
   if (!text) return;
   
   isSpeaking = true;
+  
+  // Safety timeout: if call.speak.ended webhook is missed (network issues),
+  // reset isSpeaking after a generous estimate based on text length.
+  // ~150 words/min TTS ≈ 400ms per word, plus 5s buffer
+  if (speakingSafetyTimer) clearTimeout(speakingSafetyTimer);
+  const wordCount = text.split(/\s+/).length;
+  const estimatedMs = Math.max(5000, wordCount * 400 + 5000);
+  speakingSafetyTimer = setTimeout(() => {
+    if (isSpeaking) {
+      console.log('⚠️ Speaking safety timeout — resetting isSpeaking (webhook likely missed)');
+      isSpeaking = false;
+    }
+  }, estimatedMs);
   
   // Detect language for voice selection
   const isChinese = /[\u4e00-\u9fff]/.test(text);
@@ -361,6 +377,7 @@ async function speakText(text) {
   } catch (err) {
     console.error('🔊 Speak failed:', err.message);
     isSpeaking = false;
+    if (speakingSafetyTimer) { clearTimeout(speakingSafetyTimer); speakingSafetyTimer = null; }
   }
 }
 
