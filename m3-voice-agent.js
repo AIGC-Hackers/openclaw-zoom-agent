@@ -34,16 +34,25 @@ const USE_OPENCLAW_BRAIN = process.env.USE_OPENCLAW_BRAIN === 'true';
 const OPENCLAW_GATEWAY = process.env.OPENCLAW_GATEWAY || 'http://localhost:18789';
 const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
 const OPENCLAW_AGENT = process.env.OPENCLAW_AGENT || 'main';
+// Session key targeting: use x-openclaw-session-key to route to a persistent session
+// with full workspace context (AGENTS.md, SOUL.md, MEMORY.md, tools)
+const OPENCLAW_SESSION_KEY = process.env.OPENCLAW_SESSION_KEY || '';
 
 const openai = USE_OPENCLAW_BRAIN
   ? new OpenAI({
       apiKey: OPENCLAW_TOKEN,
       baseURL: `${OPENCLAW_GATEWAY}/v1`,
+      defaultHeaders: OPENCLAW_SESSION_KEY
+        ? { 'x-openclaw-session-key': OPENCLAW_SESSION_KEY }
+        : undefined,
     })
   : new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 if (USE_OPENCLAW_BRAIN) {
   console.log(`🧠 Using OpenClaw brain (agent: ${OPENCLAW_AGENT}) at ${OPENCLAW_GATEWAY}`);
+  if (OPENCLAW_SESSION_KEY) {
+    console.log(`📌 Targeting session: ${OPENCLAW_SESSION_KEY}`);
+  }
 } else {
   console.log('🧠 Using GPT-4o-mini (standalone)');
 }
