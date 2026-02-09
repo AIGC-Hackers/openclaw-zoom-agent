@@ -399,9 +399,20 @@ async function main() {
 
   // Speak via Telnyx when Gemini generates text response
   let isSpeaking = false;
+  let speakSafetyTimer = null;
   gemini.onTextResponse = async (text) => {
     if (!callControlId || isSpeaking) return;
     isSpeaking = true;
+    if (speakSafetyTimer) clearTimeout(speakSafetyTimer);
+    // Safety timeout: auto-reset isSpeaking if webhook is missed
+    const wordCount = text.split(/\s+/).length;
+    const estimatedMs = wordCount * 400 + 5000;
+    speakSafetyTimer = setTimeout(() => {
+      if (isSpeaking) {
+        console.log('⚠️ Speaking safety timeout — resetting isSpeaking');
+        isSpeaking = false;
+      }
+    }, estimatedMs);
     const isChinese = /[\u4e00-\u9fff]/.test(text);
     try {
       await telnyxApi('POST', `/calls/${callControlId}/actions/speak`, {
@@ -412,6 +423,7 @@ async function main() {
       console.log(`🔊 Speaking: "${text.slice(0, 60)}..."`);
     } catch (err) {
       console.error('🔊 Speak failed:', err.message.slice(0, 100));
+      if (speakSafetyTimer) clearTimeout(speakSafetyTimer);
       isSpeaking = false;
     }
   };
@@ -534,6 +546,7 @@ async function main() {
     const event = req.body?.data || req.body;
     const eventType = event?.event_type;
     if (eventType === 'call.speak.ended') {
+      if (speakSafetyTimer) clearTimeout(speakSafetyTimer);
       isSpeaking = false;
       console.log('🔊 Speaking ended');
     } else if (eventType === 'call.speak.started') {

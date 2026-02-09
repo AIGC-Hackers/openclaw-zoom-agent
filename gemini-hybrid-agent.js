@@ -229,9 +229,20 @@ CRITICAL RULES:
 }
 
 // --- Speak via Telnyx ---
+let speakSafetyTimer = null;
 async function speak(text) {
   if (!callControlId || isSpeaking || !text?.trim()) return;
   isSpeaking = true;
+  if (speakSafetyTimer) clearTimeout(speakSafetyTimer);
+  // Safety timeout: auto-reset isSpeaking if webhook is missed
+  const wordCount = text.split(/\s+/).length;
+  const estimatedMs = wordCount * 400 + 5000;
+  speakSafetyTimer = setTimeout(() => {
+    if (isSpeaking) {
+      console.log('⚠️ Speaking safety timeout — resetting isSpeaking');
+      isSpeaking = false;
+    }
+  }, estimatedMs);
   const isChinese = /[\u4e00-\u9fff]/.test(text);
   try {
     // Telnyx speak: for Chinese, use 'female' voice (male not supported for cmn-CN)
@@ -243,6 +254,7 @@ async function speak(text) {
     console.log(`🔊 Speaking: "${text.slice(0, 60)}"`);
   } catch (err) {
     console.error('Speak error:', err.message.slice(0, 100));
+    if (speakSafetyTimer) clearTimeout(speakSafetyTimer);
     isSpeaking = false;
   }
 }
@@ -331,6 +343,7 @@ async function main() {
     res.sendStatus(200);
     const evt = req.body?.data?.event_type || req.body?.event_type;
     if (evt === 'call.speak.ended') {
+      if (speakSafetyTimer) clearTimeout(speakSafetyTimer);
       isSpeaking = false;
       console.log('🔊 Speak ended');
     } else if (evt) {
